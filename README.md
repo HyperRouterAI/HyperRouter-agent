@@ -1,6 +1,6 @@
 # @hyperrouter/agent
 
-Agent loop framework for [Hyper Router](https://hyperrouter.ai). Write multi-step LLM agents with first-class cost control — `callModel()` handles the conversation loop, tool dispatch, and 7 stop conditions including HR-only `maxCost` (real-time cumulative cost cap), `stopOnFallback`, and `budgetExhausted` (live account balance check). Every run is auto-grouped as a session in HR Dashboard → Logs.
+Agent loop framework for [Hyper Router](https://hyperrouter.ai) — multi-step LLM agents with built-in tools, streaming, and cost-aware stop conditions.
 
 ## Install
 
