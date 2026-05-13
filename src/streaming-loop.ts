@@ -11,7 +11,7 @@
  */
 
 import { postChatCompletionsStream, getBalance, type HttpClientConfig } from "./http-client.js";
-import { parseSseStream, chunkText, chunkToolCallDeltas, chunkFinishReason } from "./sse.js";
+import { parseSseStream, parseCostComment, chunkText, chunkToolCallDeltas, chunkFinishReason } from "./sse.js";
 import { evaluateStopConditions, asCondition } from "./stop-conditions.js";
 import { Channel } from "./channel.js";
 import type {
@@ -161,7 +161,19 @@ export async function runAgentLoopStreaming(
 
     const routing = parseRoutingHeaders(headers);
     if (routing.fallbackUsed) fallbackUsedAnyStep = true;
-    const stepCost = parseCostHeader(headers);
+    // Backend only sends X-HR-Model-Selected on auto-routed requests. When
+    // the user named the model explicitly, fall back to that name so
+    // step.routing.routedModel is never undefined in normal flows.
+    if (routing.routedModel === undefined) {
+      const requested = Array.isArray(input.model) ? input.model[0] : input.model;
+      if (typeof requested === "string") routing.routedModel = requested;
+    }
+    // Cost arrives one of two ways depending on backend version:
+    //  - X-HR-Cost response header (older deployments)
+    //  - SSE comment lines like ": cost=0.00009300" (current)
+    // Capture both. The comment value wins because it's emitted as the
+    // server finalizes billing.
+    let stepCost = parseCostHeader(headers);
 
     // Accumulate as the stream comes in.
     let textBuffer = "";
@@ -169,7 +181,12 @@ export async function runAgentLoopStreaming(
     let rawFinishReason: string | undefined;
     let stepUsage: Usage = { input: 0, output: 0, total: 0, costUsd: stepCost };
 
-    for await (const chunk of parseSseStream(stream)) {
+    for await (const chunk of parseSseStream(stream, {
+      onComment: (text) => {
+        const c = parseCostComment(text);
+        if (c !== undefined) stepCost = (stepCost ?? 0) + c;
+      },
+    })) {
       const delta = chunkText(chunk);
       if (delta) {
         textBuffer += delta;
@@ -190,6 +207,10 @@ export async function runAgentLoopStreaming(
         };
       }
     }
+
+    // Cost may have arrived via a comment line AFTER the usage chunk.
+    // Make sure the latest stepCost is reflected on stepUsage.
+    if (stepCost !== undefined) stepUsage.costUsd = stepCost;
 
     const finishReason = normalizeFinishReason(rawFinishReason);
     cumUsage.input += stepUsage.input;

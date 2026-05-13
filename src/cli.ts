@@ -196,6 +196,27 @@ async function runDoctor(): Promise<void> {
     console.log(`${c.green("✓")} HYPERROUTER_API_KEY set (${apiKey.slice(0, 8)}…)`);
   }
 
+  // Zod version check — Zod v4 with our default JSON-Schema bridge produces
+  // empty schemas, so tools get called with no arguments. Warn loudly.
+  try {
+    const zodPkg = await import("zod/package.json", { with: { type: "json" } }) as { default: { version: string } };
+    const ver = zodPkg.default?.version;
+    const [major] = (ver ?? "0").split(".").map(Number);
+    if (major === undefined) {
+      console.log(`${c.yellow("?")} zod installed but version unreadable`);
+    } else if (major >= 4) {
+      console.log(`${c.red("✗")} zod ${ver} — version 4 is not yet supported, please install zod@^3.22.0`);
+      ok = false;
+    } else if (major < 3) {
+      console.log(`${c.red("✗")} zod ${ver} — too old, please install zod@^3.22.0`);
+      ok = false;
+    } else {
+      console.log(`${c.green("✓")} zod ${ver}`);
+    }
+  } catch {
+    console.log(`${c.yellow("?")} zod not installed — tools with typed inputs will fail. Run: npm install zod@^3`);
+  }
+
   // Connectivity
   const baseUrl = process.env.HYPERROUTER_BASE_URL ?? HYPERROUTER_BASE_URL;
   try {
