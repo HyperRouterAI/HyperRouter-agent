@@ -15,6 +15,12 @@ export interface ChatCompletionsRequest {
   /** Extra HR-specific knobs sent in the request body. */
   routing?: unknown;
   byok?: unknown;
+  /**
+   * Session id — groups multiple chat completions into one session in the HR
+   * Dashboard's Logs → Sessions tab. The agent SDK uses its traceId here so
+   * every step of one callModel() shows up as one session.
+   */
+  session_id?: string;
 }
 
 export interface ChatCompletionsResponse {

@@ -14,13 +14,6 @@ import { postChatCompletionsStream, type HttpClientConfig } from "./http-client.
 import { parseSseStream, chunkText, chunkToolCallDeltas, chunkFinishReason } from "./sse.js";
 import { evaluateStopConditions } from "./stop-conditions.js";
 import { Channel } from "./channel.js";
-import {
-  postTelemetry,
-  buildTracePayload,
-  buildStepPayload,
-  buildTraceEndPayload,
-  type ObservabilityConfig,
-} from "./observability.js";
 import type {
   AgentState,
   CallModelInput,
@@ -140,9 +133,10 @@ export async function runAgentLoopStreaming(
   let cumCostUsd = 0;
   let fallbackUsedAnyStep = false;
 
-  const obs: ObservabilityConfig = { ...input.observability, traceId };
-  // Fire-and-forget trace-start telemetry.
-  void postTelemetry(config, obs, buildTracePayload(obs, input.model, input.messages.length, tools.length));
+  // Use the trace id as session_id so every chat completion in this loop is
+  // grouped under one session in the HR Dashboard's Logs → Sessions tab.
+  // Capped at 200 chars (HR backend limit).
+  const sessionId = (input.observability?.sessionId ?? traceId).slice(0, 200);
 
   for (let stepIndex = 0; ; stepIndex++) {
     const { stream, headers } = await postChatCompletionsStream(
@@ -156,6 +150,7 @@ export async function runAgentLoopStreaming(
         top_p: input.topP,
         routing: input.routing,
         byok: input.byok,
+        session_id: sessionId,
       },
       traceId,
       input.signal,
@@ -290,13 +285,9 @@ export async function runAgentLoopStreaming(
     steps.push(stepResult);
     channel.push({ type: "step-finish", step: stepResult });
 
-    // Fire-and-forget step telemetry.
-    void postTelemetry(config, obs, buildStepPayload(obs, stepResult, textBuffer));
-
     // Natural stop
     if (toolCallsArr.length === 0 && finishReason !== "tool_calls") {
       channel.push({ type: "stop", reason: { matched: "natural", message: "model finished without tool calls" } });
-      void postTelemetry(config, obs, buildTraceEndPayload(obs, steps.length, cumUsage, "natural"));
       return {
         steps,
         finalMessage: assistantMessage,
@@ -316,7 +307,6 @@ export async function runAgentLoopStreaming(
     const matched = await evaluateStopConditions(stopConditions, state);
     if (matched) {
       channel.push({ type: "stop", reason: { matched: matched.name, message: `loop stopped: ${matched.name}` } });
-      void postTelemetry(config, obs, buildTraceEndPayload(obs, steps.length, cumUsage, matched.name));
       return {
         steps,
         finalMessage: assistantMessage,
