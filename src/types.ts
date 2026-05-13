@@ -115,7 +115,13 @@ export interface CallModelInput {
   /** Model id or fallback chain. */
   model: string | string[];
   messages: Message[];
-  tools?: Tool[];
+  /**
+   * Tools the model can call. `Tool<any, any>` (not `Tool<unknown, unknown>`)
+   * because each tool has concrete TInput/TOutput types and TypeScript
+   * invariance would otherwise reject mixed arrays.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tools?: Array<Tool<any, any>>;
   /** Stop condition(s). OR-combined: any one matching stops the loop. */
   stopWhen?: StopCondition | StopCondition[];
   /** Sampling temperature. */
