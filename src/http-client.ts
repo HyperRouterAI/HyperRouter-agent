@@ -76,6 +76,63 @@ export class HyperRouterError extends Error {
   }
 }
 
+/**
+ * Streaming variant of {@link postChatCompletions}. Returns the raw response
+ * ReadableStream for SSE parsing plus the response headers (for HR routing /
+ * cost / fallback metadata). Caller is responsible for consuming the stream
+ * via `parseSseStream` from "./sse.js".
+ */
+export async function postChatCompletionsStream(
+  config: HttpClientConfig,
+  body: ChatCompletionsRequest,
+  traceId: string,
+  signal?: AbortSignal,
+): Promise<{ stream: ReadableStream<Uint8Array>; headers: Headers }> {
+  const url = `${config.baseUrl}/chat/completions`;
+  const ctl = new AbortController();
+  const timeoutId = setTimeout(() => ctl.abort(), config.timeoutMs);
+  const combinedSignal = signal ? mergeSignals(signal, ctl.signal) : ctl.signal;
+
+  try {
+    const res = await config.fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${config.apiKey}`,
+        "X-HR-Trace-Id": traceId,
+        "User-Agent": "@hyperrouter/agent",
+      },
+      body: JSON.stringify({ ...body, stream: true }),
+      signal: combinedSignal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      let parsed: unknown = text;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        /* keep raw */
+      }
+      throw new HyperRouterError(
+        `Hyper Router request failed with status ${res.status}`,
+        res.status,
+        res.headers.get("x-hr-request-id") ?? undefined,
+        parsed,
+      );
+    }
+    if (!res.body) {
+      throw new HyperRouterError("Hyper Router response missing body", res.status, undefined);
+    }
+    return { stream: res.body, headers: res.headers };
+  } finally {
+    // Timeout still applies to the response start; once we hand the stream to
+    // the caller, they own the abort lifecycle.
+    clearTimeout(timeoutId);
+  }
+}
+
 export async function postChatCompletions(
   config: HttpClientConfig,
   body: ChatCompletionsRequest,
