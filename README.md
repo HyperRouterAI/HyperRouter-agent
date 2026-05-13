@@ -5,12 +5,14 @@ Agent loop framework for [Hyper Router](https://hyperrouter.ai). Write multi-ste
 ## Install
 
 ```bash
-npm install @hyperrouter/agent
-# Optional, recommended for typed tool inputs:
-npm install zod
+npm install @hyperrouter/agent zod
 ```
 
+`zod` is recommended for typed tool inputs but optional — `toolSync()` accepts plain JSON Schema if you'd rather not pull it in.
+
 ## Quickstart
+
+> Uses top-level `await`. Save the file as `.mjs`, or set `"type": "module"` in your `package.json`.
 
 ```ts
 import { callModel, tool, stepCountIs, maxCost } from "@hyperrouter/agent";
@@ -21,7 +23,8 @@ const searchTool = await tool({
   description: "Search the web for a query",
   inputSchema: z.object({ query: z.string() }),
   execute: async ({ query }) => {
-    return { results: await webSearch(query) };
+    // replace with your real search — e.g. Tavily / Brave / your own backend
+    return { results: [`stub result for "${query}"`] };
   },
 });
 
@@ -39,6 +42,8 @@ console.log(await result.getText());
 console.log(await result.getUsage()); // { input, output, total, costUsd }
 ```
 
+More patterns (cost-capped agent, customer-support bot, PR reviewer, streaming chat, etc.) live in [`examples/`](./examples/).
+
 ## What it does
 
 - **Conversation loop**: calls model → reads tool_calls → dispatches your tool functions → feeds results back → repeats
@@ -53,7 +58,7 @@ console.log(await result.getUsage()); // { input, output, total, costUsd }
 | Function | What it does |
 |---|---|
 | `callModel(input, options?)` | Run the agent loop. Returns a lazy `ModelResult`. |
-| `tool({ name, description, inputSchema, execute })` | Define a runnable tool (async; supports Zod). |
+| `tool({ name, description, inputSchema, execute, onToolCalled?, onResponseReceived? })` | Define a runnable tool (async; supports Zod). See [Approval hooks](#what-it-does) for the `on*` hooks. |
 | `toolSync({...})` | Sync variant — plain JSON Schema only, no Zod. |
 
 ### Stop conditions
@@ -92,13 +97,45 @@ stopWhen: [stepCountIs(20), maxCost(1.0)]
 
 ```ts
 callModel({
-  // ...
-  routing: { strategy: "cost" },           // tell HR's auto router what to optimize for
+  // Pass a fallback chain instead of a single model. HR tries them left-to-right
+  // and emits X-HR-Fallback-Used: true when it switched (use `stopOnFallback()`
+  // if you want to bail out instead of silently degrading).
+  model: ["anthropic/claude-sonnet-4.6", "openai/gpt-4.1"],
+
+  // Shorthand for prepending a system message (skipped if messages already
+  // contains a system role).
+  system: "You are a research agent.",
+  messages: [{ role: "user", content: "..." }],
+
+  routing: { strategy: "cost" },           // "auto" | "cost" | "speed" | "quality"
   byok: { strict: true },                  // require user's BYOK key, never fall back to HR credits
-  observability: { traceId: "my-trace-1" }, // override the auto-generated trace id
+  observability: {
+    traceId: "my-trace-1",                 // override the auto-generated trace id
+    sessionId: "user-42-conversation-3",   // group multiple callModel() runs under one session in HR Logs
+  },
   signal: abortController.signal,          // cancel the whole loop
 });
 ```
+
+### Errors
+
+Network / 4xx / 5xx failures throw `HyperRouterError`:
+
+```ts
+import { HyperRouterError } from "@hyperrouter/agent";
+
+try {
+  await result.getText();
+} catch (e) {
+  if (e instanceof HyperRouterError) {
+    console.error(e.status, e.message, e.requestId); // status 401 / 429 / 5xx
+  } else {
+    throw e;
+  }
+}
+```
+
+Tool execution errors are NOT thrown — they're captured in `step.toolCalls[i].error` and surfaced as `{ type: "error" }` events in `getItemsStream()`. The model sees them in the next turn so it can recover.
 
 ## Authentication
 
@@ -116,7 +153,7 @@ The package ships a small CLI for scaffolding and health checks:
 npx @hyperrouter/agent init my-agent   # scaffold a new agent project
 npx @hyperrouter/agent run agent.ts    # run a TypeScript agent file via tsx
 npx @hyperrouter/agent doctor          # check node version, key, connectivity
-npx @hyperrouter/agent --version       # 0.1.0
+npx @hyperrouter/agent --version       # print the installed version
 ```
 
 After `init`, the generated project ships with an `agent.ts` template and the right `package.json` to run `npm start`.
@@ -146,13 +183,14 @@ A hung tool blocks the entire loop until `signal` fires. Race your work against 
 
 ```ts
 execute: async (input, { signal }) => {
-  const result = await Promise.race([
-    longRunningWork(input, { signal }),
+  // `yourSlowApi` is whatever your tool actually does (HTTP call,
+  // DB query, subprocess, etc.) — race it against a wall clock.
+  return await Promise.race([
+    yourSlowApi(input, { signal }),
     new Promise((_, reject) =>
       setTimeout(() => reject(new Error("tool timed out")), 30_000)
     ),
   ]);
-  return result;
 }
 ```
 
@@ -164,7 +202,8 @@ Throw real errors. The loop captures them in `step.toolCalls[i].error`, surfaces
 
 Use the inference helpers to keep tool consumers in sync with their definitions:
 
-```ts
+```tsx
+// e.g. in your React component:
 import type { InferToolInput, InferToolOutput, TypedToolCall } from "@hyperrouter/agent";
 
 type SearchInput  = InferToolInput<typeof searchTool>;
@@ -189,4 +228,4 @@ On the table for future releases (driven by real user feedback):
 
 ## License
 
-MIT
+[MIT](./LICENSE)
