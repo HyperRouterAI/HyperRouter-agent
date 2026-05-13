@@ -1,6 +1,6 @@
 {
   "name": "@hyperrouter/agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent loop framework for Hyper Router — callModel, tools, stop conditions, streaming, observability",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -51,7 +51,9 @@
     "zod": "^3.22.0"
   },
   "peerDependenciesMeta": {
-    "zod": { "optional": true }
+    "zod": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
