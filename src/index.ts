@@ -43,6 +43,14 @@ export {
 // Errors
 export { HyperRouterError, HYPERROUTER_BASE_URL } from "./http-client.js";
 
+// Observability (mostly for advanced users; default behavior is automatic)
+export type {
+  ObservabilityConfig,
+  TracePayload,
+  StepPayload,
+  TraceEndPayload,
+} from "./observability.js";
+
 // Types
 export type {
   Message,

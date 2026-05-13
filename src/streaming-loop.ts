@@ -14,6 +14,13 @@ import { postChatCompletionsStream, type HttpClientConfig } from "./http-client.
 import { parseSseStream, chunkText, chunkToolCallDeltas, chunkFinishReason } from "./sse.js";
 import { evaluateStopConditions } from "./stop-conditions.js";
 import { Channel } from "./channel.js";
+import {
+  postTelemetry,
+  buildTracePayload,
+  buildStepPayload,
+  buildTraceEndPayload,
+  type ObservabilityConfig,
+} from "./observability.js";
 import type {
   AgentState,
   CallModelInput,
@@ -132,6 +139,10 @@ export async function runAgentLoopStreaming(
   const cumUsage: Usage = { input: 0, output: 0, total: 0, costUsd: 0 };
   let cumCostUsd = 0;
   let fallbackUsedAnyStep = false;
+
+  const obs: ObservabilityConfig = { ...input.observability, traceId };
+  // Fire-and-forget trace-start telemetry.
+  void postTelemetry(config, obs, buildTracePayload(obs, input.model, input.messages.length, tools.length));
 
   for (let stepIndex = 0; ; stepIndex++) {
     const { stream, headers } = await postChatCompletionsStream(
@@ -279,9 +290,13 @@ export async function runAgentLoopStreaming(
     steps.push(stepResult);
     channel.push({ type: "step-finish", step: stepResult });
 
+    // Fire-and-forget step telemetry.
+    void postTelemetry(config, obs, buildStepPayload(obs, stepResult, textBuffer));
+
     // Natural stop
     if (toolCallsArr.length === 0 && finishReason !== "tool_calls") {
       channel.push({ type: "stop", reason: { matched: "natural", message: "model finished without tool calls" } });
+      void postTelemetry(config, obs, buildTraceEndPayload(obs, steps.length, cumUsage, "natural"));
       return {
         steps,
         finalMessage: assistantMessage,
@@ -301,6 +316,7 @@ export async function runAgentLoopStreaming(
     const matched = await evaluateStopConditions(stopConditions, state);
     if (matched) {
       channel.push({ type: "stop", reason: { matched: matched.name, message: `loop stopped: ${matched.name}` } });
+      void postTelemetry(config, obs, buildTraceEndPayload(obs, steps.length, cumUsage, matched.name));
       return {
         steps,
         finalMessage: assistantMessage,

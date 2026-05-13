@@ -138,8 +138,19 @@ export interface CallModelInput {
   };
   /** HR-specific BYOK controls (sent as extra_body.byok). */
   byok?: { strict?: boolean; disabled?: boolean };
-  /** Observability/tracing options. */
-  observability?: { traceId?: string; sessionId?: string };
+  /**
+   * Observability / tracing options. By default the SDK posts step traces
+   * to Hyper Router's /v1/agent/telemetry endpoint so they show up in the
+   * HR Dashboard. Set `disabled: true` to opt out of telemetry for this
+   * call. Globally disable with env HYPERROUTER_OBSERVABILITY=off.
+   */
+  observability?: {
+    traceId?: string;
+    sessionId?: string;
+    disabled?: boolean;
+    /** Override the telemetry endpoint URL. */
+    endpoint?: string;
+  };
   /** Cancel the overall agent loop. */
   signal?: AbortSignal;
 }
