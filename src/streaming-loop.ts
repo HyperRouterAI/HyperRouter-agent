@@ -10,9 +10,9 @@
  * disabled.
  */
 
-import { postChatCompletionsStream, type HttpClientConfig } from "./http-client.js";
+import { postChatCompletionsStream, getBalance, type HttpClientConfig } from "./http-client.js";
 import { parseSseStream, chunkText, chunkToolCallDeltas, chunkFinishReason } from "./sse.js";
-import { evaluateStopConditions } from "./stop-conditions.js";
+import { evaluateStopConditions, asCondition } from "./stop-conditions.js";
 import { Channel } from "./channel.js";
 import type {
   AgentState,
@@ -45,15 +45,18 @@ function normalizeFinishReason(raw: string | undefined): FinishReason {
 function parseRoutingHeaders(headers: Headers): RoutingMeta {
   const fallback = headers.get("x-hr-fallback-used");
   return {
-    routedModel: headers.get("x-hr-routed-model") ?? undefined,
-    provider: headers.get("x-hr-provider") ?? undefined,
+    // Header names match what HR backend emits today (src/routes/chat.ts +
+    // src/server.ts CORS expose list). Do NOT rename without grepping the
+    // backend - this is the public contract.
+    routedModel: headers.get("x-hr-model-selected") ?? undefined,
+    provider: headers.get("x-hr-provider-selected") ?? undefined,
     fallbackUsed: fallback === "true" || fallback === "1",
-    requestId: headers.get("x-hr-request-id") ?? undefined,
+    requestId: headers.get("x-hr-trace-id") ?? undefined,
   };
 }
 
 function parseCostHeader(headers: Headers): number | undefined {
-  const raw = headers.get("x-hr-cost-usd");
+  const raw = headers.get("x-hr-cost");
   if (!raw) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
@@ -296,6 +299,36 @@ export async function runAgentLoopStreaming(
       };
     }
 
+    // budgetExhausted() is special: its check function is a stub that always
+    // returns false (it has no HTTP access). We detect it by name, fetch the
+    // balance from /v1/credits/balance, and inject the result here.
+    const budgetCond = stopConditions
+      .map((c) => asCondition(c))
+      .find((c) => c.name.startsWith("budgetExhausted"));
+    if (budgetCond) {
+      const threshold = parseBudgetThreshold(budgetCond.name);
+      try {
+        const balance = await getBalance(config, input.signal);
+        if (balance.balance <= threshold) {
+          channel.push({
+            type: "stop",
+            reason: {
+              matched: budgetCond.name,
+              message: `loop stopped: balance=${balance.balance} <= ${threshold}`,
+            },
+          });
+          return {
+            steps,
+            finalMessage: assistantMessage,
+            usage: cumUsage,
+            stopReason: { name: budgetCond.name },
+          };
+        }
+      } catch {
+        // Balance fetch failed — don't fail the agent; just skip this check.
+      }
+    }
+
     // User-supplied stop conditions
     const state: AgentState = {
       steps,
@@ -315,4 +348,9 @@ export async function runAgentLoopStreaming(
       };
     }
   }
+}
+
+function parseBudgetThreshold(name: string): number {
+  const m = name.match(/threshold=([\d.]+)/);
+  return m ? Number(m[1]) : 0;
 }

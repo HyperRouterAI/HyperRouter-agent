@@ -139,16 +139,24 @@ export interface CallModelInput {
   /** HR-specific BYOK controls (sent as extra_body.byok). */
   byok?: { strict?: boolean; disabled?: boolean };
   /**
-   * Observability / tracing options. By default the SDK posts step traces
-   * to Hyper Router's /v1/agent/telemetry endpoint so they show up in the
-   * HR Dashboard. Set `disabled: true` to opt out of telemetry for this
-   * call. Globally disable with env HYPERROUTER_OBSERVABILITY=off.
+   * Observability options for the agent loop.
+   *
+   * - `traceId` / `sessionId`: identifiers the SDK threads through every
+   *   /v1/chat/completions request in this loop. The HR backend writes
+   *   `session_id` onto each `usage_logs` row, so all steps of one
+   *   `callModel()` are grouped in the HR Dashboard's Logs → Sessions tab.
+   * - `disabled` / `endpoint`: reserved for a future first-party telemetry
+   *   stream (Phase 2). They are accepted today but have no effect — the
+   *   SDK does not currently post out-of-band step traces to a separate
+   *   endpoint. Session attribution is achieved via `session_id` on each
+   *   chat completion request.
    */
   observability?: {
     traceId?: string;
     sessionId?: string;
+    /** Reserved for Phase 2 — currently a no-op. */
     disabled?: boolean;
-    /** Override the telemetry endpoint URL. */
+    /** Reserved for Phase 2 — currently a no-op. */
     endpoint?: string;
   };
   /** Cancel the overall agent loop. */

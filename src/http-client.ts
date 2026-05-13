@@ -124,7 +124,7 @@ export async function postChatCompletionsStream(
       throw new HyperRouterError(
         `Hyper Router request failed with status ${res.status}`,
         res.status,
-        res.headers.get("x-hr-request-id") ?? undefined,
+        res.headers.get("x-hr-trace-id") ?? undefined,
         parsed,
       );
     }
@@ -177,13 +177,57 @@ export async function postChatCompletions(
       throw new HyperRouterError(
         `Hyper Router request failed with status ${res.status}`,
         res.status,
-        res.headers.get("x-hr-request-id") ?? undefined,
+        res.headers.get("x-hr-trace-id") ?? undefined,
         parsed,
       );
     }
 
     const json = (await res.json()) as ChatCompletionsResponse;
     return { response: json, headers: res.headers };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export interface BalanceResponse {
+  balance: number;
+  totalToppedUp: number;
+  totalUsed: number;
+  scope?: "personal" | "org";
+  orgId?: number;
+}
+
+/**
+ * Fetch the caller's credit balance from Hyper Router. Used by the
+ * `budgetExhausted()` stop condition. Cached briefly in the agent loop so
+ * we don't hammer the endpoint on every step.
+ */
+export async function getBalance(
+  config: HttpClientConfig,
+  signal?: AbortSignal,
+): Promise<BalanceResponse> {
+  const url = `${config.baseUrl}/credits/balance`;
+  const ctl = new AbortController();
+  const timeoutId = setTimeout(() => ctl.abort(), Math.min(config.timeoutMs, 10_000));
+  const combinedSignal = signal ? mergeSignals(signal, ctl.signal) : ctl.signal;
+  try {
+    const res = await config.fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+        "User-Agent": "@hyperrouter/agent",
+      },
+      signal: combinedSignal,
+    });
+    if (!res.ok) {
+      throw new HyperRouterError(
+        `Hyper Router /credits/balance failed: ${res.status}`,
+        res.status,
+        res.headers.get("x-hr-trace-id") ?? undefined,
+      );
+    }
+    return (await res.json()) as BalanceResponse;
   } finally {
     clearTimeout(timeoutId);
   }
