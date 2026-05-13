@@ -88,7 +88,7 @@ stopWhen: [stepCountIs(20), maxCost(1.0)]
 | `.getText()` | Final assistant text |
 | `.getSteps()` | All `StepResult`s the loop produced |
 | `.getUsage()` | Cumulative token + cost usage |
-| `.getTraceId()` | Trace id for HR observability |
+| `.getTraceId()` | Trace id used for HR session grouping in Logs |
 | `.getTextStream()` | Async iterable of text deltas |
 | `.getItemsStream()` | Async iterable of every event: `text-delta`, `tool-call`, `tool-result`, `step-finish`, `stop`, `error` |
 | `.getToolCallsStream()` | Async iterable of just tool-call requests |
@@ -96,6 +96,8 @@ stopWhen: [stepCountIs(20), maxCost(1.0)]
 ### HR-native input fields
 
 ```ts
+const controller = new AbortController();
+
 callModel({
   // Pass a fallback chain instead of a single model. HR tries them left-to-right
   // and emits X-HR-Fallback-Used: true when it switched (use `stopOnFallback()`
@@ -113,7 +115,7 @@ callModel({
     traceId: "my-trace-1",                 // override the auto-generated trace id
     sessionId: "user-42-conversation-3",   // group multiple callModel() runs under one session in HR Logs
   },
-  signal: abortController.signal,          // cancel the whole loop
+  signal: controller.signal,               // call controller.abort() to cancel the whole loop
 });
 ```
 
@@ -135,7 +137,12 @@ try {
 }
 ```
 
-Tool execution errors are NOT thrown — they're captured in `step.toolCalls[i].error` and surfaced as `{ type: "error" }` events in `getItemsStream()`. The model sees them in the next turn so it can recover.
+Tool execution errors do NOT throw. They're captured in `step.toolCalls[i].error` and reach you two ways:
+
+- via `result.getSteps()` — inspect `step.toolCalls[i].error` after the loop
+- via `getItemsStream()` as part of the `{ type: "step-finish", step }` event — read `step.toolCalls[i].error` off the embedded step
+
+`{ type: "error" }` events on `getItemsStream()` are reserved for fatal loop errors (network / 4xx / SDK bugs), not individual tool failures. The model also sees each tool error injected as a `tool` message in the next turn, so it can recover or escalate.
 
 ## Authentication
 
@@ -162,17 +169,22 @@ After `init`, the generated project ships with an `agent.ts` template and the ri
 
 ### Make tools idempotent
 
-The agent loop may retry a tool call (model re-emits the same call after an error, user replays a session, etc.). If your tool has side effects, design it so calling it twice with the same input is safe — use idempotency keys when writing to external systems, check before insert, etc. A tool that creates a duplicate row on every retry is the #1 production footgun.
+The agent loop may invoke the same tool twice (model emits the same call again on the next turn, framework retries a transient error, you replay a session for debugging, etc.). If your tool has side effects, design it so calling it twice with the same input is safe — use idempotency keys when writing to external systems, check-before-insert, etc. A tool that creates a duplicate row on every retry is the #1 production footgun.
 
 ```ts
+import { createHash } from "node:crypto";
+
 const sendEmail = await tool({
   name: "send_email",
   inputSchema: z.object({ to: z.string(), subject: z.string(), body: z.string() }),
-  execute: async ({ to, subject, body }, ctx) => {
-    // Use the agent-loop step id as the idempotency key so a retry of the
-    // same step is a no-op rather than a second email.
-    const idempotencyKey = `${ctx.traceId}-${ctx.step}`;
-    return await emailClient.send({ to, subject, body, idempotencyKey });
+  execute: async (input, ctx) => {
+    // Hash the input so duplicate calls (same to/subject/body) are deduped
+    // by your downstream system even across separate callModel() runs.
+    // ctx.traceId + ctx.step protects only within a single loop — combining
+    // it with the input hash covers cross-run replay too.
+    const inputHash = createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 16);
+    const idempotencyKey = `${inputHash}-${ctx.traceId}-${ctx.step}`;
+    return await emailClient.send({ ...input, idempotencyKey });
   },
 });
 ```
@@ -196,7 +208,7 @@ execute: async (input, { signal }) => {
 
 ### Don't swallow errors
 
-Throw real errors. The loop captures them in `step.toolCalls[i].error`, surfaces them in `getItemsStream()` as `{ type: "error" }`, and the model sees them in the next turn so it can recover or escalate. Returning `{ error: "..." }` as a normal output looks like success to the model and produces silent failure modes.
+Throw real errors. The loop captures them in `step.toolCalls[i].error` (visible via `getSteps()` and on the `step-finish` event), and re-injects each one as a `tool` message in the model's next turn so it can recover or escalate. Returning `{ error: "..." }` as a normal output instead looks like success to the model and produces silent failure modes.
 
 ### Type the I/O at the call site
 
