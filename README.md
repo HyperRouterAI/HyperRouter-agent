@@ -43,10 +43,10 @@ console.log(await result.getUsage()); // { input, output, total, costUsd }
 
 - **Conversation loop**: calls model → reads tool_calls → dispatches your tool functions → feeds results back → repeats
 - **Stop conditions**: built-in helpers (`stepCountIs`, `maxTokensUsed`, `maxCost`, `hasToolCall`, `finishReasonIs`, `stopOnFallback`, `budgetExhausted`) plus custom predicates
-- **Streaming**: text deltas, tool calls, step events as they happen (Phase 2)
+- **Streaming**: text deltas, tool calls, step-finish events as they happen — true SSE under the hood
 - **Type-safe tools**: Zod-schema inputs auto-converted to JSON Schema for the model
-- **Approval hooks** (HITL): `tool({ onToolCalled })` to require user confirmation before risky tool calls
-- **HR-native observability**: every step is reported to Hyper Router so you can see step trees, cost breakdown, and fallback events in the Dashboard
+- **Approval hooks**: `tool({ onToolCalled })` to allow/deny risky tool calls (synchronous; long-running human-in-the-loop pause/resume is on the roadmap)
+- **Session-grouped observability**: every chat completion carries a `session_id`, so all steps of one `callModel()` are grouped under one session in HR Dashboard's Logs → Sessions tab
 
 ## API
 
@@ -85,7 +85,7 @@ stopWhen: [stepCountIs(20), maxCost(1.0)]
 | `.getUsage()` | Cumulative token + cost usage |
 | `.getTraceId()` | Trace id for HR observability |
 | `.getTextStream()` | Async iterable of text deltas |
-| `.getItemsStream()` | Async iterable of message / tool-call / tool-result events |
+| `.getItemsStream()` | Async iterable of every event: `text-delta`, `tool-call`, `tool-result`, `step-finish`, `stop`, `error` |
 | `.getToolCallsStream()` | Async iterable of just tool-call requests |
 
 ### HR-native input fields
@@ -107,6 +107,19 @@ By default reads `HYPERROUTER_API_KEY` from env. Override per-call:
 ```ts
 callModel(input, { apiKey: "hr-..." });
 ```
+
+## CLI
+
+The package ships a small CLI for scaffolding and health checks:
+
+```bash
+npx @hyperrouter/agent init my-agent   # scaffold a new agent project
+npx @hyperrouter/agent run agent.ts    # run a TypeScript agent file via tsx
+npx @hyperrouter/agent doctor          # check node version, key, connectivity
+npx @hyperrouter/agent --version       # 0.1.0
+```
+
+After `init`, the generated project ships with an `agent.ts` template and the right `package.json` to run `npm start`.
 
 ## Best practices for tools
 
@@ -164,12 +177,15 @@ function SearchProgress({ call }: { call: TypedToolCall<typeof searchTool> }) {
 
 ## Roadmap
 
-This is Phase 1 (core loop + stop conditions + tools). Coming:
+`0.1.x` ships with the core loop, 7 stop conditions, true SSE streaming, tool dispatch with Zod, an `init / run / doctor` CLI, and session-grouped observability via HR Dashboard.
 
-- Phase 2: True SSE streaming (`getTextStream()` currently buffers)
-- Phase 3: Observability hooks → Hyper Router DevTools (step-tree visualization)
-- Phase 4: `npx @hyperrouter/agent run <skill>` CLI for non-developers
-- Phase 5: Examples + docs site integration
+On the table for future releases (driven by real user feedback):
+
+- Local DevTools — a `localhost:4983` viewer that visualises every `callModel()` run (timeline, request/response inspector, cost breakdown, run diff). Pairs with our existing session traces.
+- `nextTurnParams` — let a tool mutate the next turn's `model` / `instructions` / `temperature` (skill loading, cost-aware model escalation).
+- Generator tools — `execute: async function* () { yield progress }` so UIs can show in-flight tool progress without leaking it to the model.
+- Pause/resume HITL — return a sentinel from `onToolCalled` to suspend the loop until a separate API call resumes it (Devin-style long-running agents).
+- Format converters — `fromChatMessages` / `fromClaudeMessages` adapters for one-line migration from OpenAI / Anthropic SDKs.
 
 ## License
 
