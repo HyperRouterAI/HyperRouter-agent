@@ -216,3 +216,38 @@ export interface RequestOptions {
   /** Default request timeout (ms). */
   timeoutMs?: number;
 }
+
+/* ───────────────────────── Type-inference utilities ─────────────────────────
+ *
+ * Helpers for users who want to derive types from a tool definition (e.g.
+ * to type a React component that displays the tool's input or output).
+ *
+ * Example:
+ *
+ *   const search = await tool({
+ *     name: "search",
+ *     description: "Search the web",
+ *     inputSchema: z.object({ query: z.string() }),
+ *     execute: async ({ query }) => ({ results: [`hit for ${query}`] }),
+ *   });
+ *
+ *   type SearchInput  = InferToolInput<typeof search>;   // { query: string }
+ *   type SearchOutput = InferToolOutput<typeof search>;  // { results: string[] }
+ *
+ *   function SearchCard({ call }: { call: TypedToolCall<typeof search> }) {
+ *     return <pre>{JSON.stringify(call.input, null, 2)}</pre>;
+ *   }
+ */
+
+/** Extract a tool's input type. */
+export type InferToolInput<T> = T extends Tool<infer I, unknown> ? I : never;
+
+/** Extract a tool's output type. */
+export type InferToolOutput<T> = T extends Tool<unknown, infer O> ? O : never;
+
+/** A tool-call request narrowed to a specific tool's input type. */
+export interface TypedToolCall<T> {
+  id: string;
+  toolName: T extends Tool<unknown, unknown> ? string : never;
+  input: InferToolInput<T>;
+}

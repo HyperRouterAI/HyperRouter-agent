@@ -64,4 +64,7 @@ export type {
   StopConditionFn,
   AgentState,
   RequestOptions,
+  InferToolInput,
+  InferToolOutput,
+  TypedToolCall,
 } from "./types.js";

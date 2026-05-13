@@ -108,6 +108,60 @@ By default reads `HYPERROUTER_API_KEY` from env. Override per-call:
 callModel(input, { apiKey: "hr-..." });
 ```
 
+## Best practices for tools
+
+### Make tools idempotent
+
+The agent loop may retry a tool call (model re-emits the same call after an error, user replays a session, etc.). If your tool has side effects, design it so calling it twice with the same input is safe — use idempotency keys when writing to external systems, check before insert, etc. A tool that creates a duplicate row on every retry is the #1 production footgun.
+
+```ts
+const sendEmail = await tool({
+  name: "send_email",
+  inputSchema: z.object({ to: z.string(), subject: z.string(), body: z.string() }),
+  execute: async ({ to, subject, body }, ctx) => {
+    // Use the agent-loop step id as the idempotency key so a retry of the
+    // same step is a no-op rather than a second email.
+    const idempotencyKey = `${ctx.traceId}-${ctx.step}`;
+    return await emailClient.send({ to, subject, body, idempotencyKey });
+  },
+});
+```
+
+### Add a per-tool timeout
+
+A hung tool blocks the entire loop until `signal` fires. Race your work against a tight timeout so a slow upstream surfaces quickly:
+
+```ts
+execute: async (input, { signal }) => {
+  const result = await Promise.race([
+    longRunningWork(input, { signal }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("tool timed out")), 30_000)
+    ),
+  ]);
+  return result;
+}
+```
+
+### Don't swallow errors
+
+Throw real errors. The loop captures them in `step.toolCalls[i].error`, surfaces them in `getItemsStream()` as `{ type: "error" }`, and the model sees them in the next turn so it can recover or escalate. Returning `{ error: "..." }` as a normal output looks like success to the model and produces silent failure modes.
+
+### Type the I/O at the call site
+
+Use the inference helpers to keep tool consumers in sync with their definitions:
+
+```ts
+import type { InferToolInput, InferToolOutput, TypedToolCall } from "@hyperrouter/agent";
+
+type SearchInput  = InferToolInput<typeof searchTool>;
+type SearchOutput = InferToolOutput<typeof searchTool>;
+
+function SearchProgress({ call }: { call: TypedToolCall<typeof searchTool> }) {
+  return <code>searching for "{call.input.query}"</code>;
+}
+```
+
 ## Roadmap
 
 This is Phase 1 (core loop + stop conditions + tools). Coming:
