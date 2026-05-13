@@ -1,11 +1,19 @@
 /**
- * The core agent loop. Given an initial set of messages and tools, runs the
- * model → tool-dispatch → model → ... cycle until a stop condition fires or
- * the model returns finish_reason != "tool_calls".
+ * Stream-first agent loop. Each step uses /v1/chat/completions with stream=true,
+ * yields text deltas as they arrive, then dispatches tool calls when the
+ * stream completes, and feeds results back to the next step.
+ *
+ * Events are pushed into a Channel that callModel result getters subscribe to.
+ *
+ * Replaces the buffer-based loop in agent-loop.ts for callModel's main flow.
+ * The buffer loop is kept as a fallback for cases where streaming fails or is
+ * disabled.
  */
 
-import { postChatCompletions, type HttpClientConfig } from "./http-client.js";
-import { evaluateStopConditions, asCondition } from "./stop-conditions.js";
+import { postChatCompletionsStream, type HttpClientConfig } from "./http-client.js";
+import { parseSseStream, chunkText, chunkToolCallDeltas, chunkFinishReason } from "./sse.js";
+import { evaluateStopConditions } from "./stop-conditions.js";
+import { Channel } from "./channel.js";
 import type {
   AgentState,
   CallModelInput,
@@ -14,7 +22,9 @@ import type {
   RoutingMeta,
   StepResult,
   StopCondition,
+  StreamItem,
   Tool,
+  ToolCallRequest,
   ToolContext,
   Usage,
 } from "./types.js";
@@ -67,20 +77,47 @@ function toToolsPayload(tools: Tool[] | undefined) {
   }));
 }
 
-export interface RunLoopOptions {
+interface ToolCallAccumulator {
+  id: string;
+  name: string;
+  argsBuffer: string;
+}
+
+/** Apply incremental tool_call deltas from an SSE chunk to in-flight accumulators. */
+function applyToolCallDelta(
+  accs: Map<number, ToolCallAccumulator>,
+  delta: ReturnType<typeof chunkToolCallDeltas>[number],
+): void {
+  const idx = delta.index ?? 0;
+  let acc = accs.get(idx);
+  if (!acc) {
+    acc = { id: delta.id ?? "", name: delta.function?.name ?? "", argsBuffer: "" };
+    accs.set(idx, acc);
+  }
+  if (delta.id) acc.id = delta.id;
+  if (delta.function?.name) acc.name = delta.function.name;
+  if (delta.function?.arguments) acc.argsBuffer += delta.function.arguments;
+}
+
+export interface RunStreamingLoopOptions {
   config: HttpClientConfig;
   input: CallModelInput;
   traceId: string;
+  /** Channel to push StreamItem events into. */
+  channel: Channel<StreamItem>;
 }
 
-export interface LoopResult {
+export interface StreamingLoopResult {
   steps: StepResult[];
   finalMessage: Message;
   usage: Usage;
   stopReason: { name: string };
 }
 
-export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): Promise<LoopResult> {
+export async function runAgentLoopStreaming(
+  opts: RunStreamingLoopOptions,
+): Promise<StreamingLoopResult> {
+  const { config, input, traceId, channel } = opts;
   const tools = input.tools ?? [];
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const toolsPayload = toToolsPayload(tools);
@@ -95,10 +132,9 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
   const cumUsage: Usage = { input: 0, output: 0, total: 0, costUsd: 0 };
   let cumCostUsd = 0;
   let fallbackUsedAnyStep = false;
-  let lastFinishReason: FinishReason = "unknown";
 
   for (let stepIndex = 0; ; stepIndex++) {
-    const { response, headers } = await postChatCompletions(
+    const { stream, headers } = await postChatCompletionsStream(
       config,
       {
         model: input.model,
@@ -114,39 +150,65 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
       input.signal,
     );
 
-    const choice = response.choices[0];
-    if (!choice) {
-      throw new Error("Hyper Router returned no choices in response");
-    }
-    const assistantMessage: Message = {
-      role: "assistant",
-      content: choice.message.content ?? "",
-      tool_calls: choice.message.tool_calls,
-    };
-    const finishReason = normalizeFinishReason(choice.finish_reason);
-    lastFinishReason = finishReason;
     const routing = parseRoutingHeaders(headers);
     if (routing.fallbackUsed) fallbackUsedAnyStep = true;
+    const stepCost = parseCostHeader(headers);
 
-    const stepUsage: Usage = {
-      input: response.usage?.prompt_tokens ?? 0,
-      output: response.usage?.completion_tokens ?? 0,
-      total: response.usage?.total_tokens ?? 0,
-      cacheRead: response.usage?.prompt_tokens_details?.cached_tokens ?? response.usage?.cache_read_input_tokens,
-      cacheWrite: response.usage?.cache_creation_input_tokens,
-      costUsd: parseCostHeader(headers),
-    };
+    // Accumulate as the stream comes in.
+    let textBuffer = "";
+    const toolAccs = new Map<number, ToolCallAccumulator>();
+    let rawFinishReason: string | undefined;
+    let stepUsage: Usage = { input: 0, output: 0, total: 0, costUsd: stepCost };
 
+    for await (const chunk of parseSseStream(stream)) {
+      const delta = chunkText(chunk);
+      if (delta) {
+        textBuffer += delta;
+        channel.push({ type: "text-delta", delta, stepIndex });
+      }
+      for (const tcd of chunkToolCallDeltas(chunk)) {
+        applyToolCallDelta(toolAccs, tcd);
+      }
+      const fr = chunkFinishReason(chunk);
+      if (fr) rawFinishReason = fr;
+      if (chunk.usage) {
+        stepUsage = {
+          input: chunk.usage.prompt_tokens ?? 0,
+          output: chunk.usage.completion_tokens ?? 0,
+          total: chunk.usage.total_tokens ?? 0,
+          cacheRead: chunk.usage.prompt_tokens_details?.cached_tokens,
+          costUsd: stepCost,
+        };
+      }
+    }
+
+    const finishReason = normalizeFinishReason(rawFinishReason);
     cumUsage.input += stepUsage.input;
     cumUsage.output += stepUsage.output;
     cumUsage.total += stepUsage.total;
     if (stepUsage.costUsd) cumCostUsd += stepUsage.costUsd;
     cumUsage.costUsd = cumCostUsd;
 
-    // Execute requested tool calls, if any.
+    // Reconstruct tool_call array from accumulators.
+    const toolCallsArr: ToolCallRequest[] = Array.from(toolAccs.values()).map((a) => ({
+      id: a.id,
+      type: "function" as const,
+      function: { name: a.name, arguments: a.argsBuffer },
+    }));
+
+    const assistantMessage: Message = {
+      role: "assistant",
+      content: textBuffer,
+      tool_calls: toolCallsArr.length > 0 ? toolCallsArr : undefined,
+    };
+
+    // Dispatch tool calls (if any). Always push the assistant message first,
+    // then each tool's reply, mirroring buffer-loop semantics.
     const toolCallsExecuted: StepResult["toolCalls"] = [];
-    if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
-      for (const tc of choice.message.tool_calls) {
+    if (toolCallsArr.length > 0) {
+      messages.push(assistantMessage);
+      for (const tc of toolCallsArr) {
+        channel.push({ type: "tool-call", toolCall: tc, stepIndex });
         const toolImpl = toolsByName.get(tc.function.name);
         const ctx: ToolContext = {
           step: stepIndex,
@@ -158,7 +220,6 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
         if (!toolImpl) {
           const err = { message: `Unknown tool requested by model: ${tc.function.name}` };
           toolCallsExecuted.push({ request: tc, error: err });
-          messages.push(assistantMessage);
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
@@ -166,7 +227,6 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
           });
           continue;
         }
-
         try {
           const parsed = toolImpl.parseInput(tc.function.arguments);
           if (toolImpl.onToolCalled) {
@@ -174,7 +234,6 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
             if (!approval.approved) {
               const reason = approval.reason ?? "tool call rejected by approval hook";
               toolCallsExecuted.push({ request: tc, error: { message: reason } });
-              messages.push(assistantMessage);
               messages.push({
                 role: "tool",
                 tool_call_id: tc.id,
@@ -184,18 +243,13 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
             }
           }
           const output = await toolImpl.execute(parsed, ctx);
-          if (toolImpl.onResponseReceived) {
-            toolImpl.onResponseReceived(parsed, output, ctx);
-          }
+          if (toolImpl.onResponseReceived) toolImpl.onResponseReceived(parsed, output, ctx);
           toolCallsExecuted.push({ request: tc, output });
-          // Push assistant + tool result back into the conversation.
-          // (We only push assistant message once per step — handled below.)
-          messages.push(assistantMessage);
+          channel.push({ type: "tool-result", toolCallId: tc.id, output, stepIndex });
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
-            content:
-              typeof output === "string" ? output : JSON.stringify(output),
+            content: typeof output === "string" ? output : JSON.stringify(output),
           });
         } catch (e) {
           const err = {
@@ -203,7 +257,6 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
             stack: e instanceof Error ? e.stack : undefined,
           };
           toolCallsExecuted.push({ request: tc, error: err });
-          messages.push(assistantMessage);
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
@@ -212,7 +265,6 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
         }
       }
     } else {
-      // No tool calls — just record the assistant message.
       messages.push(assistantMessage);
     }
 
@@ -225,21 +277,11 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
       routing,
     };
     steps.push(stepResult);
+    channel.push({ type: "step-finish", step: stepResult });
 
-    // Build state for stop-condition evaluation
-    const state: AgentState = {
-      steps,
-      usage: cumUsage,
-      totalCostUsd: cumCostUsd,
-      finishReason,
-      fallbackUsed: fallbackUsedAnyStep,
-    };
-
-    // Natural stop: no tool calls and finish_reason indicates completion.
-    if (
-      (!choice.message.tool_calls || choice.message.tool_calls.length === 0) &&
-      finishReason !== "tool_calls"
-    ) {
+    // Natural stop
+    if (toolCallsArr.length === 0 && finishReason !== "tool_calls") {
+      channel.push({ type: "stop", reason: { matched: "natural", message: "model finished without tool calls" } });
       return {
         steps,
         finalMessage: assistantMessage,
@@ -249,8 +291,16 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
     }
 
     // User-supplied stop conditions
+    const state: AgentState = {
+      steps,
+      usage: cumUsage,
+      totalCostUsd: cumCostUsd,
+      finishReason,
+      fallbackUsed: fallbackUsedAnyStep,
+    };
     const matched = await evaluateStopConditions(stopConditions, state);
     if (matched) {
+      channel.push({ type: "stop", reason: { matched: matched.name, message: `loop stopped: ${matched.name}` } });
       return {
         steps,
         finalMessage: assistantMessage,
@@ -258,11 +308,5 @@ export async function runAgentLoop({ config, input, traceId }: RunLoopOptions): 
         stopReason: matched,
       };
     }
-
-    // Loop continues.
   }
 }
-
-/** Re-exported for tests / introspection. */
-export { asCondition };
-export type { AgentState };

@@ -1,12 +1,11 @@
 /**
- * Public entry point. Wraps the agent loop with a lazy ModelResult.
- *
- * The result is constructed synchronously — the loop runs on first await of
- * `getText()` / `getSteps()` / `getUsage()` / stream iterators.
+ * Public entry point. Runs the streaming agent loop once on first await,
+ * pushes events into a Channel, and exposes them via lazy getters.
  */
 
-import { runAgentLoop } from "./agent-loop.js";
+import { runAgentLoopStreaming, type StreamingLoopResult } from "./streaming-loop.js";
 import { resolveConfig } from "./http-client.js";
+import { Channel } from "./channel.js";
 import type {
   CallModelInput,
   ModelResult,
@@ -26,20 +25,31 @@ function newTraceId(prefix = "agent"): string {
 export function callModel(input: CallModelInput, options: RequestOptions = {}): ModelResult {
   const config = resolveConfig(options);
   const traceId = input.observability?.traceId ?? newTraceId();
+  const channel = new Channel<StreamItem>();
 
-  // Lazy: hold a promise that resolves once the loop has run end-to-end.
-  // Multiple result getters share the same promise.
-  let cached: ReturnType<typeof runAgentLoop> | null = null;
-  const ensureRun = () => {
-    if (!cached) cached = runAgentLoop({ config, input, traceId });
-    return cached;
+  // Kick off the loop on the first await of any getter. Multiple awaits share
+  // the same promise; the channel is broadcast so multiple streams can iterate.
+  let runPromise: Promise<StreamingLoopResult> | null = null;
+  const ensureRun = (): Promise<StreamingLoopResult> => {
+    if (!runPromise) {
+      runPromise = runAgentLoopStreaming({ config, input, traceId, channel })
+        .then((res) => {
+          channel.close();
+          return res;
+        })
+        .catch((err) => {
+          channel.push({ type: "error", error: err instanceof Error ? err : new Error(String(err)) });
+          channel.close(err);
+          throw err;
+        });
+    }
+    return runPromise;
   };
 
-  const result: ModelResult = {
+  return {
     async getText() {
       const { finalMessage } = await ensureRun();
       if (typeof finalMessage.content === "string") return finalMessage.content;
-      // Compose multi-part assistant message into a single string.
       return (finalMessage.content as Array<{ type: string; text?: string }>)
         .map((p) => (p.type === "text" ? (p.text ?? "") : ""))
         .join("");
@@ -56,63 +66,28 @@ export function callModel(input: CallModelInput, options: RequestOptions = {}): 
       return traceId;
     },
     getTextStream(): AsyncIterable<string> {
-      return textStreamFromResult(ensureRun);
+      const sub = channel.subscribe();
+      // Start the run lazily — subscribers don't trigger it on their own.
+      void ensureRun();
+      return (async function* () {
+        for await (const item of sub) {
+          if (item.type === "text-delta") yield item.delta;
+        }
+      })();
     },
     getItemsStream(): AsyncIterable<StreamItem> {
-      return itemsStreamFromResult(ensureRun);
+      const sub = channel.subscribe();
+      void ensureRun();
+      return sub;
     },
     getToolCallsStream(): AsyncIterable<ToolCallRequest> {
-      return toolCallsStreamFromResult(ensureRun);
+      const sub = channel.subscribe();
+      void ensureRun();
+      return (async function* () {
+        for await (const item of sub) {
+          if (item.type === "tool-call") yield item.toolCall;
+        }
+      })();
     },
   };
-
-  return result;
-}
-
-async function* textStreamFromResult(
-  ensureRun: () => ReturnType<typeof runAgentLoop>,
-): AsyncIterable<string> {
-  // Phase-1 implementation: not true streaming. Awaits the full loop then
-  // yields the final text as a single chunk. Phase-2 will switch to true SSE
-  // streaming via the underlying chat.completions endpoint.
-  const { finalMessage } = await ensureRun();
-  const text =
-    typeof finalMessage.content === "string"
-      ? finalMessage.content
-      : (finalMessage.content as Array<{ type: string; text?: string }>)
-          .map((p) => (p.type === "text" ? (p.text ?? "") : ""))
-          .join("");
-  yield text;
-}
-
-async function* itemsStreamFromResult(
-  ensureRun: () => ReturnType<typeof runAgentLoop>,
-): AsyncIterable<StreamItem> {
-  const { steps, stopReason } = await ensureRun();
-  for (const step of steps) {
-    for (const tc of step.toolCalls) {
-      yield { type: "tool-call", toolCall: tc.request, stepIndex: step.index };
-      if (tc.output !== undefined) {
-        yield {
-          type: "tool-result",
-          toolCallId: tc.request.id,
-          output: tc.output,
-          stepIndex: step.index,
-        };
-      }
-    }
-    yield { type: "step-finish", step };
-  }
-  yield { type: "stop", reason: { matched: stopReason.name, message: `loop stopped: ${stopReason.name}` } };
-}
-
-async function* toolCallsStreamFromResult(
-  ensureRun: () => ReturnType<typeof runAgentLoop>,
-): AsyncIterable<ToolCallRequest> {
-  const { steps } = await ensureRun();
-  for (const step of steps) {
-    for (const tc of step.toolCalls) {
-      yield tc.request;
-    }
-  }
 }
