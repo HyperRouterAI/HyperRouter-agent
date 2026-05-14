@@ -188,7 +188,7 @@ async function runDoctor(): Promise<void> {
   const apiKey = process.env.HYPERROUTER_API_KEY;
   if (!apiKey) {
     console.log(`${c.red("✗")} HYPERROUTER_API_KEY not set`);
-    console.log(`  ${c.dim("Create one at https://hyperrouter.ai/dashboard and export it.")}`);
+    console.log(`  ${c.dim("Create one at https://hyperrouter.ai/dashboard/api-keys and export it.")}`);
     ok = false;
   } else if (!apiKey.startsWith("hr-")) {
     console.log(`${c.yellow("?")} HYPERROUTER_API_KEY does not start with 'hr-' — is this a Hyper Router key?`);
@@ -198,9 +198,14 @@ async function runDoctor(): Promise<void> {
 
   // Zod version check — Zod v4 with our default JSON-Schema bridge produces
   // empty schemas, so tools get called with no arguments. Warn loudly.
+  // Use createRequire instead of `import "zod/package.json" with { type: "json" }`
+  // because the import-attribute syntax isn't supported across all Node 18+
+  // build pipelines (TS without proper assertions support, older tsx, etc.).
   try {
-    const zodPkg = await import("zod/package.json", { with: { type: "json" } }) as { default: { version: string } };
-    const ver = zodPkg.default?.version;
+    const { createRequire } = await import("node:module");
+    const req = createRequire(import.meta.url);
+    const zodPkg = req("zod/package.json") as { version: string };
+    const ver = zodPkg.version;
     const [major] = (ver ?? "0").split(".").map(Number);
     if (major === undefined) {
       console.log(`${c.yellow("?")} zod installed but version unreadable`);
@@ -215,6 +220,20 @@ async function runDoctor(): Promise<void> {
     }
   } catch {
     console.log(`${c.yellow("?")} zod not installed — tools with typed inputs will fail. Run: npm install zod@^3`);
+  }
+
+  // zod-to-json-schema check — direct dep since 0.1.3. Without it, tools'
+  // Zod input schemas are converted to empty placeholders, models get no
+  // argument hints, and tool calls return empty args (Zod validation then
+  // fails with confusing "expected string, received undefined" errors).
+  try {
+    const { createRequire } = await import("node:module");
+    const req = createRequire(import.meta.url);
+    const z2jPkg = req("zod-to-json-schema/package.json") as { version: string };
+    console.log(`${c.green("✓")} zod-to-json-schema ${z2jPkg.version}`);
+  } catch {
+    console.log(`${c.red("✗")} zod-to-json-schema not resolvable — tool argument schemas will be empty, tool calls will fail. Run: npm install zod-to-json-schema@^3`);
+    ok = false;
   }
 
   // Connectivity

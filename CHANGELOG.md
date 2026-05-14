@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **🚨 P0: tool argument schemas silently empty when `zod-to-json-schema` not installed** — `schema.ts:zodToJsonSchema` lazy-imported `zod-to-json-schema` and fell back to `{ type: "object", properties: {}, additionalProperties: true }` on import failure. Since `zod-to-json-schema` was NOT listed as a dependency / peerDependency, fresh installs (`npm install @hyperrouter/agent zod`) would consistently fall into this branch — every tool's input schema became an empty placeholder, the model received no argument hints, returned `{}` for arguments, and downstream Zod validation failed with confusing "expected string, received undefined" errors. Tool calls appeared to work (they were dispatched) but always with no args.
+  Fix: (1) added `zod-to-json-schema` to `dependencies` (auto-installed with the SDK), (2) the fallback path now logs a loud one-time `console.error` warning so future install failures aren't silent, (3) `doctor` command now explicitly checks `zod-to-json-schema` resolvability and fails the health check if missing.
+
 - **P0b: `model: string[]` → 400 from HR backend** — `CallModelInput.model` was typed as `string | string[]` but Hyper Router's `/v1/chat/completions` Fastify schema only accepts `model: { type: "string" }`. Real fallback-chain calls were returning `400 body/model must be string`. Split the single overloaded field into two:
   - `model: string` — the primary slug (required, always string)
   - `fallbackModels?: string[]` — ordered fallback chain
