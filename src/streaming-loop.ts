@@ -371,6 +371,35 @@ export async function runAgentLoopStreaming(
       };
     }
 
+    // Abnormal stream termination — no text, no tools, no usage, no finish_reason.
+    // Happens when the upstream provider's SSE stream is cut off before the
+    // terminal chunk (e.g. HR-api's Anthropic→OpenAI adapter drops `message_delta`
+    // when upstream truncates). Surface as a distinct stop reason instead of
+    // pretending it was a clean natural completion — otherwise callers see
+    // `getText() === ""` with `matched: "natural"` and think the model just
+    // chose to say nothing.
+    if (
+      toolCallsArr.length === 0 &&
+      textBuffer === "" &&
+      stepUsage.total === 0 &&
+      finishReason === "unknown"
+    ) {
+      channel.push({
+        type: "stop",
+        reason: {
+          matched: "stream_incomplete",
+          message:
+            "upstream stream ended without content, usage, or finish_reason — likely a transient truncation",
+        },
+      });
+      return {
+        steps,
+        finalMessage: assistantMessage,
+        usage: cumUsage,
+        stopReason: { name: "stream_incomplete" },
+      };
+    }
+
     // Natural stop — no tool calls and no user condition matched. Bail out
     // here so we don't fire another no-op model call.
     if (toolCallsArr.length === 0 && finishReason !== "tool_calls") {
