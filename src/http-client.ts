@@ -5,7 +5,9 @@ import type { RequestOptions, Message, ToolDefinition } from "./types.js";
 export const HYPERROUTER_BASE_URL = "https://api.hyperrouter.ai/v1";
 
 export interface ChatCompletionsRequest {
-  model: string | string[];
+  model: string;
+  /** Multi-model fallback list — HR backend takes this as priority over `model`. */
+  models?: string[];
   messages: Message[];
   tools?: Array<{ type: "function"; function: ToolDefinition }>;
   temperature?: number;

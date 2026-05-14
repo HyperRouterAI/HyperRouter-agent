@@ -99,10 +99,11 @@ stopWhen: [stepCountIs(20), maxCost(1.0)]
 const controller = new AbortController();
 
 callModel({
-  // Pass a fallback chain instead of a single model. HR tries them left-to-right
-  // and emits X-HR-Fallback-Used: true when it switched (use `stopOnFallback()`
-  // if you want to bail out instead of silently degrading).
-  model: ["anthropic/claude-sonnet-4.6", "openai/gpt-4.1"],
+  model: "anthropic/claude-sonnet-4.6",
+  // Optional fallback chain — HR tries these left-to-right if the primary
+  // model fails, and emits X-HR-Fallback-Used: true when switching. Use
+  // `stopOnFallback()` to bail out instead of silently degrading.
+  fallbackModels: ["openai/gpt-4.1"],
 
   // Shorthand for prepending a system message (skipped if messages already
   // contains a system role).
