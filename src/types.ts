@@ -112,8 +112,14 @@ export interface RoutingMeta {
 
 /** Input to `callModel()`. */
 export interface CallModelInput {
-  /** Model id or fallback chain. */
-  model: string | string[];
+  /** Primary model id (e.g. "anthropic/claude-sonnet-4.6"). */
+  model: string;
+  /**
+   * Optional fallback chain — HR tries these left-to-right if the primary
+   * model fails. HR emits X-HR-Fallback-Used: true when switching. Use
+   * `stopOnFallback()` to bail out instead of silently degrading.
+   */
+  fallbackModels?: string[];
   messages: Message[];
   /**
    * Tools the model can call. `Tool<any, any>` (not `Tool<unknown, unknown>`)

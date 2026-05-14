@@ -20,22 +20,37 @@ export function isZodSchema(s: unknown): s is { parse: (raw: unknown) => unknown
   );
 }
 
-/** Convert a Zod schema to a JSON Schema. Lazily imports zod-to-json-schema if needed. */
+/**
+ * Convert a Zod schema to a JSON Schema. `zod-to-json-schema` is a direct
+ * dependency (not optional) since 0.1.3 — empty-schema silent fallback led
+ * to model receiving `{ properties: {} }` for every tool, returning empty
+ * arg objects, and downstream Zod validation failing with confusing
+ * "expected string, received undefined" errors. If the import ever fails
+ * (broken install, registry mirror, etc.) we log loudly and STILL return
+ * an empty placeholder so the SDK doesn't hard-crash, but it's now a
+ * top-of-stderr warning instead of a silent footgun.
+ */
+let warnedMissingConverter = false;
+
 export async function zodToJsonSchema(schema: { _def: unknown }): Promise<Record<string, unknown>> {
   try {
-    // Lazy dynamic import. If `zod-to-json-schema` isn't installed, fall back
-    // to a basic placeholder so we don't hard-fail the SDK.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mod: any = await import("zod-to-json-schema" as string).catch(() => null);
     if (mod && typeof mod.zodToJsonSchema === "function") {
       return mod.zodToJsonSchema(schema as never) as Record<string, unknown>;
     }
   } catch {
-    /* fall through */
+    /* fall through to warning */
   }
-  // Minimal fallback: empty object schema. The model will still receive the
-  // tool definition; argument validation just won't enforce shape until the
-  // user installs zod-to-json-schema.
+  if (!warnedMissingConverter) {
+    warnedMissingConverter = true;
+    console.error(
+      "[@hyperrouter/agent] zod-to-json-schema not resolvable — tool input " +
+      "schemas will be empty placeholders, causing models to receive no " +
+      "argument hints and Zod validation to fail downstream. " +
+      "Reinstall the SDK or run `npm install zod-to-json-schema@^3` directly.",
+    );
+  }
   return { type: "object", properties: {}, additionalProperties: true };
 }
 

@@ -12,6 +12,11 @@
 
 export interface ChatChunk {
   id?: string;
+  /** Model that actually served the request — OpenAI-compatible streams
+   * include this in every chunk. For requests routed via hyperrouter/auto
+   * (or backend-internal fallback) this is the resolved slug, NOT what
+   * the client originally asked for. */
+  model?: string;
   choices?: Array<{
     index?: number;
     finish_reason?: string | null;

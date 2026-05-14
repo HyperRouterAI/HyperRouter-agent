@@ -146,6 +146,15 @@ export async function runAgentLoopStreaming(
       config,
       {
         model: input.model,
+        // HR backend's `models[]` array takes priority over single `model` —
+        // `models[0]` becomes the primary slug. So when fallbackModels is set,
+        // we prepend `input.model` so the primary stays primary and fallbacks
+        // come after. When fallbackModels is empty/undefined, omit `models`
+        // entirely and let the backend use the single `model` path.
+        models:
+          input.fallbackModels && input.fallbackModels.length > 0
+            ? [input.model, ...input.fallbackModels]
+            : undefined,
         messages,
         tools: toolsPayload,
         temperature: input.temperature,
@@ -161,13 +170,6 @@ export async function runAgentLoopStreaming(
 
     const routing = parseRoutingHeaders(headers);
     if (routing.fallbackUsed) fallbackUsedAnyStep = true;
-    // Backend only sends X-HR-Model-Selected on auto-routed requests. When
-    // the user named the model explicitly, fall back to that name so
-    // step.routing.routedModel is never undefined in normal flows.
-    if (routing.routedModel === undefined) {
-      const requested = Array.isArray(input.model) ? input.model[0] : input.model;
-      if (typeof requested === "string") routing.routedModel = requested;
-    }
     // Cost arrives one of two ways depending on backend version:
     //  - X-HR-Cost response header (older deployments)
     //  - SSE comment lines like ": cost=0.00009300" (current)
@@ -187,6 +189,12 @@ export async function runAgentLoopStreaming(
         if (c !== undefined) stepCost = (stepCost ?? 0) + c;
       },
     })) {
+      // The model field on each chunk is the ACTUAL model that served the
+      // request — if HR auto-routed or fell back, this differs from the
+      // user's `input.model`. Take the first non-empty value we see.
+      if (chunk.model && !routing.routedModel) {
+        routing.routedModel = chunk.model;
+      }
       const delta = chunkText(chunk);
       if (delta) {
         textBuffer += delta;
@@ -309,17 +317,11 @@ export async function runAgentLoopStreaming(
     steps.push(stepResult);
     channel.push({ type: "step-finish", step: stepResult });
 
-    // Natural stop
-    if (toolCallsArr.length === 0 && finishReason !== "tool_calls") {
-      channel.push({ type: "stop", reason: { matched: "natural", message: "model finished without tool calls" } });
-      return {
-        steps,
-        finalMessage: assistantMessage,
-        usage: cumUsage,
-        stopReason: { name: "natural" },
-      };
-    }
-
+    // Stop-condition evaluation happens BEFORE the "natural finish" check so
+    // a user-supplied condition that matched on this step (maxCost, etc.)
+    // wins even when the model finished in one turn. Otherwise stop conditions
+    // on short runs would never fire.
+    //
     // budgetExhausted() is special: its check function is a stub that always
     // returns false (it has no HTTP access). We detect it by name, fetch the
     // balance from /v1/credits/balance, and inject the result here.
@@ -366,6 +368,18 @@ export async function runAgentLoopStreaming(
         finalMessage: assistantMessage,
         usage: cumUsage,
         stopReason: matched,
+      };
+    }
+
+    // Natural stop — no tool calls and no user condition matched. Bail out
+    // here so we don't fire another no-op model call.
+    if (toolCallsArr.length === 0 && finishReason !== "tool_calls") {
+      channel.push({ type: "stop", reason: { matched: "natural", message: "model finished without tool calls" } });
+      return {
+        steps,
+        finalMessage: assistantMessage,
+        usage: cumUsage,
+        stopReason: { name: "natural" },
       };
     }
   }
